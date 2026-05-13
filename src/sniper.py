@@ -23,7 +23,9 @@ Created: 2026-05-03
 import asyncio
 import logging
 import time
+import weakref
 from dataclasses import dataclass, field
+from decimal import Decimal
 from typing import Optional, Dict, Any, List
 
 from src.maker_loop import OrderRecord, WindowFillSummary
@@ -50,9 +52,22 @@ MIN_SNIPE_PRICE = 0.10
 # Timeout for the snipe execution in seconds
 SNIPE_TIMEOUT_S = 2.0
 
-# Order type for snipe — GTC like gabagool22 (not FOK)
-# His orders sit on the book as limit orders, not fill-or-kill
+# Order type for snipe — GTC (not FOK)
 SNIPE_ORDER_TYPE = "GTC"
+
+# ── EV Gate (DAL 4) ──────────────────────────────────────────────────────────
+# Estimated on-chain transaction count per snipe:
+#   1× cancel opposing ladder  +  1× place snipe  +  1× settlement merge
+ESTIMATED_TX_COUNT   = Decimal("3")
+
+# Polygon gas cost per transaction (conservative estimate in USD)
+# Adjust via config.gas_cost_per_tx at runtime.
+DEFAULT_GAS_COST_USD = Decimal("0.003")
+
+# Minimum acceptable net EV after gas drag.
+# Below this floor we expose capital to Polymarket counterparty risk
+# for mathematically negligible (or zero) edge.
+MIN_EV_FLOOR_USD     = Decimal("0.05")
 
 
 # ============================================================================
@@ -113,6 +128,10 @@ class Sniper:
         self.ask_buffer   = ask_buffer
         self.max_price    = max_price
         self.logger       = logging.getLogger("sniper")
+
+        # DAL 1 / WeakSet fix: track all pending 800ms cleanup tasks so we
+        # can await them on shutdown rather than leaving zombie coroutines.
+        self._pending_cleanups: weakref.WeakSet = weakref.WeakSet()
 
     # -------------------------------------------------------------------------
     # Public API
@@ -179,6 +198,37 @@ class Sniper:
                     shares=self.snipe_shares, order_id=None, cancels_fired=0,
                     latency_ms=latency_ms, error=f"price_too_low_{snipe_price:.2f}",
                 )
+
+            # ── DAL 4: Strict Decimal Net-EV Gate ────────────────────────────
+            # Float arithmetic is prohibited here: 0.15 - 0.05 in IEEE-754
+            # resolves to 0.09999999999999998, which can fail a >= 0.10 check.
+            # All EV math uses exact Decimal arithmetic.
+            _p_cost   = Decimal(str(snipe_price))
+            _shares   = Decimal(str(self.snipe_shares))
+            _gas_rate = Decimal(str(
+                getattr(getattr(self.bot, "config", None), "gas_cost_per_tx", None)
+                or DEFAULT_GAS_COST_USD
+            ))
+            _gross_profit = (Decimal("1.00") - _p_cost) * _shares
+            _total_gas    = _gas_rate * ESTIMATED_TX_COUNT
+            _net_ev       = _gross_profit - _total_gas
+
+            if _net_ev < MIN_EV_FLOOR_USD:
+                latency_ms = (time.monotonic_ns() - start_ns) / 1e6
+                self.logger.warning(
+                    "Snipe ABORTED — insufficient EV | gross=$%.3f gas=$%.3f "
+                    "net_ev=$%.3f < floor=$%.3f | price=%.2f shares=%d",
+                    float(_gross_profit), float(_total_gas),
+                    float(_net_ev), float(MIN_EV_FLOOR_USD),
+                    snipe_price, self.snipe_shares,
+                )
+                return SnipeResult(
+                    success=False, direction=direction, price_paid=snipe_price,
+                    shares=self.snipe_shares, order_id=None, cancels_fired=0,
+                    latency_ms=latency_ms,
+                    error=f"insufficient_ev_{float(_net_ev):.3f}",
+                )
+            # ── End EV Gate ───────────────────────────────────────────────────
 
             # ── Phase 2: FIRE snipe + cancel opposing ─────────────────────
             # If free capital is insufficient to cover the snipe cost, we must
@@ -341,9 +391,13 @@ class Sniper:
                 # If this GTC snipe only partially fills (e.g. 3/10 shares),
                 # the remaining 7 resting at peak-volatility price become
                 # adverse liquidity on mean-reversion. Cancel after 800ms.
-                asyncio.create_task(
+                # WeakSet fix: track the task so shutdown() can await it.
+                cleanup_task = asyncio.create_task(
                     self._cancel_snipe_remnant(order_id, delay_ms=800)
                 )
+                self._pending_cleanups.add(cleanup_task)
+                # Auto-discard from WeakSet when done (prevents set growth)
+                cleanup_task.add_done_callback(self._pending_cleanups.discard)
                 return order_id
             return None
         except Exception as e:
@@ -366,6 +420,21 @@ class Sniper:
         except Exception as e:
             # Cancellation failing means the order was already fully filled—fine.
             self.logger.debug("Snipe remnant cancel no-op (likely filled): %s", e)
+
+    async def shutdown(self) -> None:
+        """WeakSet fix: Drain all pending 800ms cleanup tasks before shutdown.
+
+        Without this, any cleanup task still in-flight when the event loop
+        closes will raise 'Task was destroyed but it is pending!' and may
+        leave orphan orders sitting on the book.
+        """
+        pending = list(self._pending_cleanups)
+        if pending:
+            self.logger.info(
+                "Sniper shutdown: awaiting %d pending cleanup task(s)...", len(pending)
+            )
+            await asyncio.gather(*pending, return_exceptions=True)
+            self.logger.info("Sniper shutdown: all cleanup tasks drained.")
 
     def _record_snipe_fill(
         self,
