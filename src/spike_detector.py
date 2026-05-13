@@ -113,25 +113,46 @@ class SpikeDetector:
         threshold_pct: float = SPIKE_THRESHOLD_PCT,
         window_s: int = SPIKE_WINDOW_S,
         cooldown_s: float = COOLDOWN_AFTER_SNIPE_S,
+        window_duration_s: float = 900.0,
     ):
-        self.threshold_pct = threshold_pct
-        self.window_s      = window_s
-        self.cooldown_s    = cooldown_s
+        self.threshold_pct      = threshold_pct
+        self.window_s           = window_s
+        self.cooldown_s         = cooldown_s
+        self.window_duration_s  = window_duration_s  # used for Gamma-aware decay
 
         self._last_snipe_at: Optional[float] = None
         self.logger = logging.getLogger("spike_detector")
+
+    def dynamic_threshold(self, seconds_remaining: Optional[float] = None) -> float:
+        """DAL 3 fix: Time-decaying spike threshold.
+
+        Threshold is 2× base at window open, decays linearly to 1× base
+        at expiry. This prevents firing snipes early in the window when a
+        $16 BTC move shifts binary probability by only 2 cents, while
+        allowing the same move to trigger a snipe near expiry when it
+        shifts probability by 40 cents.
+
+        Formula: threshold(t) = base × (1 + t_remain / window_duration)
+        """
+        if seconds_remaining is None:
+            return self.threshold_pct  # static fallback
+        safe = max(0.0, min(seconds_remaining, self.window_duration_s))
+        multiplier = 1.0 + (safe / self.window_duration_s)  # 2.0 at open, 1.0 at expiry
+        return self.threshold_pct * multiplier
 
     # -------------------------------------------------------------------------
     # Public API
     # -------------------------------------------------------------------------
 
-    def check(self, price_feed) -> SpikeResult:
+    def check(self, price_feed, seconds_remaining: Optional[float] = None) -> SpikeResult:
         """
-        Evaluate the price feed for a spike. Call this as fast as possible
-        (every tick or every ~0.1s from the main loop).
+        Evaluate the price feed for a spike.
 
         Args:
-            price_feed: A BinancePriceFeed instance
+            price_feed:        A BinancePriceFeed instance
+            seconds_remaining: Seconds until window closes. If provided,
+                               enables Gamma-aware time-decaying threshold
+                               (DAL 3 fix). Pass None for static threshold.
 
         Returns:
             SpikeResult describing the current state
@@ -139,6 +160,9 @@ class SpikeDetector:
         now = time.time()
         current_price = price_feed.get_current_price()
         cooldown_remaining = self._cooldown_remaining(now)
+
+        # Compute effective threshold (static or time-decayed)
+        effective_threshold = self.dynamic_threshold(seconds_remaining)
 
         # --- Gate 1: Need live data ---
         if current_price is None or not price_feed.has_data():
@@ -172,8 +196,8 @@ class SpikeDetector:
                 cooldown_remaining_s=0.0,
             )
 
-        # --- Gate 4: Threshold check ---
-        if momentum_5s >= self.threshold_pct:
+        # --- Gate 4: Threshold check (Gamma-aware) ---
+        if momentum_5s >= effective_threshold:
             # Mark cooldown IMMEDIATELY (atomic) so concurrent windows
             # that check() in the same tick see COOLDOWN, not a second spike.
             was_in_cooldown = self.in_cooldown
@@ -200,7 +224,7 @@ class SpikeDetector:
                 cooldown_remaining_s=self._cooldown_remaining(now),
             )
 
-        if momentum_5s <= -self.threshold_pct:
+        if momentum_5s <= -effective_threshold:
             was_in_cooldown = self.in_cooldown
             if not was_in_cooldown:
                 self._last_snipe_at = time.time()

@@ -331,16 +331,41 @@ class Sniper:
                 price,
                 float(self.snipe_shares),
                 "BUY",
-                "GTC",  # GTC limit — sits on book like gabagool22, fills naturally
+                "GTC",
             )
             if result:
                 order_id = result.get("orderID", f"snipe_{int(time.time())}")
                 self.logger.debug("Snipe order placed: id=%s", order_id[:16])
+
+                # DAL 1 fix: Schedule toxic remnant cleanup.
+                # If this GTC snipe only partially fills (e.g. 3/10 shares),
+                # the remaining 7 resting at peak-volatility price become
+                # adverse liquidity on mean-reversion. Cancel after 800ms.
+                asyncio.create_task(
+                    self._cancel_snipe_remnant(order_id, delay_ms=800)
+                )
                 return order_id
             return None
         except Exception as e:
             self.logger.error("Snipe order placement failed: %s", e)
             return None
+
+    async def _cancel_snipe_remnant(self, order_id: str, delay_ms: int = 800) -> None:
+        """DAL 1 fix: Toxic remnant cleanup for GTC snipe orders.
+
+        Waits delay_ms then cancels any unfilled portion of the snipe order.
+        If the order was fully filled before the timeout, the cancel call
+        safely no-ops (Polymarket returns a non-error on already-filled orders).
+        This prevents partial fills from sitting at peak-volatility prices
+        and being swept by market-makers on mean-reversion.
+        """
+        await asyncio.sleep(delay_ms / 1000.0)
+        try:
+            await asyncio.to_thread(self.bot.cancel_order, order_id)
+            self.logger.debug("Snipe remnant cleanup: cancelled order %s", order_id[:16])
+        except Exception as e:
+            # Cancellation failing means the order was already fully filled—fine.
+            self.logger.debug("Snipe remnant cancel no-op (likely filled): %s", e)
 
     def _record_snipe_fill(
         self,

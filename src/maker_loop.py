@@ -542,26 +542,49 @@ class MakerLoop:
         last_down_post_at: float,
         now: float,
     ) -> None:
-        """Post the full Gabagool22-style price ladder on both sides.
+        """Post the full price ladder on both sides.
 
-        Instead of one order at best bid, we blast the entire book:
-          - Floor bids ($0.10-0.20): cheap lottery — fills on extreme moves
-          - Mid zone ($0.25-0.60):   core delta-neutral farming
-          - Snipe layer ($0.65-0.85): fills on spike — replaces FOK snipe
-
-        We only repost the ladder if FARM_REFRESH_S has elapsed since
-        the last ladder was placed on that side (not per-order).
+        Skew-aware ladder management (DAL 2 fix):
+          - If UP:DOWN ratio > 2:1, restrict DOWN side to floor bids only
+          - If DOWN:UP ratio > 2:1, restrict UP side to floor bids only
+          - At 3:1 (HEDGE_IMBALANCE_RATIO), block entirely
+        This prevents the asymmetric volume loss scenario where the
+        overweight side's cost exceeds the winning side's payout.
         """
         up_sh   = max(summary.up_shares, 0.1)
         down_sh = max(summary.down_shares, 0.1)
-        up_allowed   = (up_sh / down_sh) < HEDGE_IMBALANCE_RATIO
-        down_allowed = (down_sh / up_sh) < HEDGE_IMBALANCE_RATIO
+        up_ratio   = up_sh / down_sh
+        down_ratio = down_sh / up_sh
+
+        # Skew thresholds
+        FLOOR_ONLY_RATIO = 2.0   # above this, restrict overweight side to floor bids
+
+        up_allowed   = up_ratio   < HEDGE_IMBALANCE_RATIO
+        down_allowed = down_ratio < HEDGE_IMBALANCE_RATIO
+
+        # Determine if the overweight side should be restricted to floor bids
+        # (i.e., only $0.10-$0.15 rungs — cheap hedges that can't make things worse)
+        up_floor_only   = up_ratio   >= FLOOR_ONLY_RATIO and up_allowed
+        down_floor_only = down_ratio >= FLOOR_ONLY_RATIO and down_allowed
+
+        if up_floor_only:
+            self.logger.debug(
+                "Skew guard: UP %.0f:1 — restricting DOWN to floor bids only | %s",
+                up_ratio, summary.market_id[:12]
+            )
+        if down_floor_only:
+            self.logger.debug(
+                "Skew guard: DOWN %.0f:1 — restricting UP to floor bids only | %s",
+                down_ratio, summary.market_id[:12]
+            )
 
         # Always allow bootstrap rungs until each side has at least 2 fills
         if summary.up_fills < 2:
             up_allowed = True
+            up_floor_only = False
         if summary.down_fills < 2:
             down_allowed = True
+            down_floor_only = False
 
         # ── Hard capital cap: $1,000 global / 4 windows = $250 per window ──
         locked_resting = sum(
@@ -578,13 +601,15 @@ class MakerLoop:
         if up_allowed and summary.up_shares < self.farm_max_shares:
             if (now - last_up_post_at) >= FARM_REFRESH_S:
                 await self._post_ladder(
-                    market.yes_token_id, "UP", active_orders, summary
+                    market.yes_token_id, "UP", active_orders, summary,
+                    floor_only=up_floor_only
                 )
 
         if down_allowed and summary.down_shares < self.farm_max_shares:
             if (now - last_down_post_at) >= FARM_REFRESH_S:
                 await self._post_ladder(
-                    market.no_token_id, "DOWN", active_orders, summary
+                    market.no_token_id, "DOWN", active_orders, summary,
+                    floor_only=down_floor_only
                 )
 
 
@@ -594,21 +619,30 @@ class MakerLoop:
         side: str,
         active_orders: Dict[str, OrderRecord],
         summary: WindowFillSummary,
+        floor_only: bool = False,
     ) -> None:
-        """Blast the full price ladder — all rungs at once.
+        """Blast the price ladder — all rungs at once.
 
-        Matches gabagool22's pattern of 10-18 orders per market per direction
-        covering $0.10 → $0.85 in $0.05 increments.
+        floor_only=True (DAL 2 skew guard): only posts the $0.10-$0.15
+        floor bids on the overweight side. These are cheap hedges that
+        cannot worsen the asymmetric loss scenario since their cost is
+        negligible relative to any payout.
         """
+        # Floor rungs only: $0.10, $0.15 — cheap enough to never create
+        # asymmetric loss regardless of which side wins
+        FLOOR_RUNGS = [p for p in LADDER_STEPS if p <= 0.15]
+        steps = FLOOR_RUNGS if floor_only else LADDER_STEPS
+
         tasks = []
-        for price in LADDER_STEPS:
+        for price in steps:
             tasks.append(self._post_ladder_rung(token_id, side, price, active_orders, summary))
 
         results = await asyncio.gather(*tasks, return_exceptions=True)
         placed = sum(1 for r in results if r is True)
+        label = "[FLOOR ONLY]" if floor_only else ""
         self.logger.debug(
-            "Ladder posted: %s %s | %d/%d rungs placed",
-            side, summary.market_id[:12], placed, len(LADDER_STEPS)
+            "Ladder posted: %s %s %s | %d/%d rungs placed",
+            side, summary.market_id[:12], label, placed, len(steps)
         )
 
     async def _post_ladder_rung(
